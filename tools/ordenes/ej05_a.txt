@@ -1,0 +1,7 @@
+clear
+./ej05_eco_servidor 7799
+#split
+#focus 1
+clear
+./ej05_eco_cliente 127.0.0.1 7799
+hola, esto es una prueba

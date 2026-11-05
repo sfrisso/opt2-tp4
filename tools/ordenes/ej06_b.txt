@@ -1,0 +1,10 @@
+clear
+./ej06_udp_servidor 7788
+#split
+#focus 0
+#wait 1
+#key C-c
+#focus 1
+clear
+./ej06_udp_cliente 127.0.0.1 7788
+./ej06_udp_cliente 127.0.0.1 7788 conectado

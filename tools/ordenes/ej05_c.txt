@@ -1,0 +1,11 @@
+clear
+./ej05_eco_servidor 7800
+#split
+#focus 1
+clear
+./ej05_eco_cliente 127.0.0.1 7800
+hola, cierro primero yo
+#key C-d
+#wait 2
+ss -tan | grep 7800
+./ej05_eco_cliente 127.0.0.1 7777

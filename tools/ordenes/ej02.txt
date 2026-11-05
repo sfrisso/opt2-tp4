@@ -1,0 +1,2 @@
+clear
+./ej02_endianness

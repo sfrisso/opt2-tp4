@@ -1,0 +1,3 @@
+clear
+./ej03_resolver google.com https
+./ej03_resolver example.com 8080

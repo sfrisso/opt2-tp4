@@ -1,0 +1,864 @@
+Optativa II - Integración de Redes (Intemetworking) – 2026
+Práctica: Tema 4 – Sockets
+Respuestas a las preguntas del trabajo práctico
+===============================================================================
+
+Entorno de ejecución: Linux (kernel 6.x), compilador gcc con -Wall -Wextra
+(sin errores ni advertencias), netcat-openbsd, tmux, ss (iproute2).
+Todos los programas fueron compilados con:
+
+    gcc -Wall -Wextra -o programa programa.c
+
+y verificados ejecutándolos antes de tomar las capturas.
+
+
+REQUISITOS COMUNES A TODOS LOS PROGRAMAS
+-------------------------------------------------------------------------------
+1. Todas las llamadas a la API verifican su valor de retorno:
+   - perror() / strerror(errno) para socket, bind, listen, accept, send,
+     recv, sendto, recvfrom, connect, close, setsockopt (errores de errno);
+   - gai_strerror(rc) para getaddrinfo() y getnameinfo() (devuelven el error
+     directamente, NO usan errno).
+   Ningún programa se rinde sin avisar: informa el error y continúa (por
+   ejemplo ej01 informa el fallo de un socket y sigue con los demás, o
+   ej06_udp_servidor avisa si un bind falla y prueba la siguiente dirección).
+2. Todos validan argv y muestran el mensaje de uso con exit status 1:
+   ./ej01_sockets [reutilizar]
+   ./ej03_resolver <host> <servicio>
+   ./ej04_saludo_servidor <puerto>      (además valida rango 1..65535)
+   ./ej05_eco_servidor <puerto> [noreuse]
+   ./ej05_eco_cliente <host> <servicio>
+   ./ej06_udp_servidor <puerto>
+   ./ej06_udp_cliente <host> <puerto> [conectado]
+3. Se aplican htons/htonl/ntohs/ntohl en todos los valores que entran o
+   salen de una estructura de dirección: sin_port (htons al asignar y
+   ntohs al mostrar), sin_addr (htonl(INADDR_ANY)) y los puertos que
+   devuelve getnameinfo() ya vienen en orden de red (se muestran tal cual
+   tras ntohs cuando corresponde).
+4. Las estructuras de dirección se inicializan en cero con memset(&addr, 0,
+   sizeof addr) antes de completarlas (struct sockaddr_in, struct addrinfo
+   hints, struct sockaddr_storage del origen en UDP).
+5. Se liberan los recursos: close() de todos los descriptores (incluido el
+   de la conexión aceptada, en cada iteración) y freeaddrinfo(res) de la
+   lista devuelta por getaddrinfo() tanto en los clientes como en el
+   servidor UDP. En los errores de arranque también se cierra el descriptor
+   antes de salir.
+6. El código está comentado explicando las decisiones importantes (por qué
+   protocolo 0, por qué SO_REUSEADDR, por qué NI_MAXSERV, por qué se
+   recorren todas las direcciones, qué hace connect() en UDP, etc.).
+
+
+================================================================================
+EJERCICIO 1 – ej01_sockets.c
+================================================================================
+
+Salida real del programa (ver capturas ej01_a.png y ej01_b.png):
+
+  == Creación de sockets (protocolo 0) ==
+  socket(AF_INET, SOCK_STREAM, 0)                -> descriptor 3
+  socket(AF_INET, SOCK_DGRAM, 0)                 -> descriptor 4
+  socket(AF_INET6, SOCK_STREAM, 0)               -> descriptor 5
+
+  == Cierre de los tres sockets ==
+  close(3) TCP/IPv4   OK
+  close(4) UDP/IPv4   OK
+  close(5) TCP/IPv6   OK
+
+  == Punto 4: combinación inválida ==
+  socket(AF_INET, SOCK_STREAM, IPPROTO_UDP) falló: Protocol not supported (errno=93)
+
+  == Pregunta 4: otra combinación inválida ==
+  socket(AF_INET, SOCK_DGRAM, IPPROTO_TCP) falló: Protocol not supported (errno=93)
+
+Con "reutilizar" (ej01_b.png):
+
+  == Pregunta 2: cierro el primer socket y creo otro ==
+  Cierro el descriptor 3 (TCP/IPv4)
+  socket(AF_INET, SOCK_STREAM, 0)                -> descriptor 3
+  El socket nuevo reutiliza el descriptor liberado (3)
+
+
+P1. ¿Qué valores tienen los descriptores obtenidos? ¿Por qué son esos y no otros?
+--------------------------------------------------------------------------------
+Los descriptores son 3, 4 y 5. Linux (y POSIX en general) asigna siempre el
+número de descriptor LIBRE MÁS BAJO que encuentre en la tabla de descriptores
+del proceso. Los descriptores 0, 1 y 2 ya están ocupados desde la arranque del
+proceso por la estándar de entrada, la estándar de salida y la estándar de
+error (stdin, stdout, stderr), que shell los abre antes de ejecutar el
+programa. Por eso el primer socket recibe el 3, el segundo el 4 y el tercero
+el 5. Si el programa se ejecutara con alguna de esas tres cerradas (p. ej.
+./ej01_sockets 2>/dev/null), el número obtenido sería distinto: lo que importa
+es que siempre se entrega el hueco más bajo disponible.
+
+
+P2. ¿Qué sucede con la numeración si se cierra el primer socket y se crea uno nuevo?
+--------------------------------------------------------------------------------
+Al cerrar el descriptor 3 y crear un socket nuevo, éste vuelve a ser el 3
+(se observa en la salida con "reutilizar"). close() devuelve el hueco a la
+tabla de descriptores del proceso y, como es el más bajo libre, el siguiente
+socket() lo reutiliza. El programa lo comprueba sin necesidad de modificarlo
+a mano: el modo "reutilizar" hace exactamente esa prueba
+(./ej01_sockets reutilizar). Esto tiene consecuencias prácticas: si un
+programa guarda "el descriptor" en una variable y cierra otro socket por
+error, puede acabar usando un descriptor que ya no es el suyo (el caso
+clásico del doble close y del uso de un descriptor ya reasignado).
+
+
+P3. ¿Qué error se obtiene en el punto 4? ¿Por qué esa combinación no es válida?
+--------------------------------------------------------------------------------
+Se obtiene:
+
+    socket(AF_INET, SOCK_STREAM, IPPROTO_UDP)
+        falló: Protocol not supported (errno=93)
+
+errno 93 es EPROTONOSUPPORT. La combinación no es válida porque el TIPO de
+socket y el PROTOCOLO describen cosas distintas y deben ser coherentes:
+
+  - SOCK_STREAM define el SEMÁNTICO del socket: orientado a conexión, flujo
+    de bytes confiable, ordenado y sin límites de mensaje.
+  - IPPROTO_UDP define el MECANISMOS de la red: datagramas sueltos, sin
+    conexión, sin garantías de entrega ni de orden.
+
+UDP simplemente no puede ofrecer la semántica que pide SOCK_STREAM (no hay
+conexoión que establecer, no hay flujo que reordenar ni retransmitir), así
+que no existe esa implementación y el kernel rechaza la llamada sin crear
+nada. En el enunciado el mensaje dice "protocol not supported": se refiere a
+que el protocolo no es soportado EN ESA COMBINACIÓN, no a que UDP esté
+ausente en la máquina (con SOCK_DGRAM + 0 funciona perfectamente).
+
+Relación tipo/protocolo que sí es válida en Linux:
+
+    socket(AF_INET, SOCK_STREAM, 0)  -> TCP   (0 = protocolo por defecto del tipo)
+    socket(AF_INET, SOCK_DGRAM,  0)  -> UDP
+    socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)  -> válida (redundante)
+    socket(AF_INET, SOCK_DGRAM,   IPPROTO_UDP) -> válida (redundante)
+    socket(AF_INET, SOCK_STREAM, IPPROTO_UDP)  -> EPROTONOSUPPORT (93)
+    socket(AF_INET, SOCK_DGRAM,   IPPROTO_TCP) -> EPROTONOSUPPORT (93)
+
+El argumento protocolo = 0 significa "el protocolo por defecto que
+corresponde al tipo elegido", que es justamente por qué los tres sockets del
+punto 1 se crean sin problema. El único caso donde el argumento protocolo
+aporta información real es con SOCK_RAW (p. ej. IPPROTO_ICMP), porque ahí el
+tipo no determina el protocolo.
+
+
+P4. ¿Qué error se obtiene con socket(AF_INET, SOCK_DGRAM, IPPROTO_TCP)? ¿Por qué?
+--------------------------------------------------------------------------------
+El mismo error, por simetría:
+
+    socket(AF_INET, SOCK_DGRAM, IPPROTO_TCP)
+        falló: Protocol not supported (errno=93)
+
+Ahora se pide un socket con la semántica de datagrama (SOCK_DGRAM: mensajes
+sueltos, sin conexión) implementado con TCP, que es un protocolo de
+transporte orientado a conexión con flujo confiable. TCP necesita handshake,
+números de secuencia, retransmisiones y un estado de conexión que simplemente
+no tienen sentido para un socket de datagramas sin conexión. La combinación
+es incoherente en el mismo sentido que la anterior y el kernel la rechaza con
+EPROTONOSUPPORT (93).
+
+
+================================================================================
+EJERCICIO 2 – ej02_endianness.c
+================================================================================
+
+Salida real del programa (ver captura ej02.png):
+
+  == 1. Orden de bytes del host ==
+  uint16_t con valor 0x0102 en memoria:       02 01
+  -> LITTLE-ENDIAN: el byte menos significativo (0x02) está primero.
+
+  == 2. Puerto 8080 (0x1F90) ==
+  8080 en el host (uint16_t):                 90 1F
+  htons(8080) en memoria:                     1F 90
+  (en hexadecimal: 1F 90 => 90 1F)
+
+  == 3. Dirección 0xC0A8010A (192.168.1.10) ==
+  0xC0A8010A en el host (uint32_t):           0A 01 A8 C0
+  htonl(0xC0A8010A) en memoria:               C0 A8 01 0A
+  (0A 01 A8 C0 => C0 A8 01 0A)
+
+  == 4. campo sin_port de struct sockaddr_in ==
+  sin_port = 8080 (sin htons)  -> ntohs(sin_port) = 36895
+  sin_port = htons(8080)       -> ntohs(sin_port) = 8080
+
+
+P1. ¿Es la máquina little-endian o big-endian? Justificar a partir de la salida.
+--------------------------------------------------------------------------------
+Es LITTLE-ENDIAN. El programa guarda 0x0102 en un uint16_t y recorre la
+variable con un puntero a unsigned char: en memoria se observa "02 01", o sea
+que el byte MENOS significativo (0x02, el de las unidades) está en la dirección
+más baja. Eso es exactamente la definición de little-endian (orden del "final
+pequeño", como Intel/x86-64). En una máquina big-endian el mismo valor se
+escribiría "01 02", con el byte más significativo primero (como algunas
+sparc/m68k o la representación que se usa en la red).
+
+Nota: este mismo razonamiento explica el punto 2: 8080 = 0x1F90 se escribe
+en el host como "90 1F" (little-endian) y tras htons() queda "1F 90", que es
+justamente cómo se transporta el puerto en la red.
+
+
+P2. ¿Qué valor devuelve ntohs() en el punto 4 cuando no se usa htons()?
+--------------------------------------------------------------------------------
+Devuelve 36895.
+
+La asignación sa.sin_port = 8080 escribe 8080 = 0x1F90 en orden de host,
+o sea los bytes "90 1F" en memoria. ntohs() interpreta esos bytes como si
+estuvieran en orden de red (big-endian) y convierte "90 1F" (big-endian) al
+entero de host: 0x901F = 36895 en decimal. Es decir, la función no "adivina"
+que el valor estaba mal: hace su trabajo (interpretar el contenido como orden
+de red) sobre datos que nunca debieron estar ahí sin convertir, y devuelve un
+número absurdo. Con la asignación correcta (htons(8080)) el campo contiene
+"1F 90" en memoria, ntohs() lo traduce y devuelve 8080, como corresponde.
+
+
+P3. ¿Qué consecuencia tendría ese error en un servidor real?
+--------------------------------------------------------------------------------
+El servidor escucharía en un puerto equivocado. Ejemplos concretos:
+
+  - Si el servidor hace sa.sin_port = 8080 en vez de htons(8080) en una
+    máquina little-endian, en realidad queda escuchando en el puerto 0x901F
+    = 36895. bind() NO falla (el valor es un puerto legal), así que el
+    servidor arranca "con éxito" pero inaccesible: cualquier cliente que se
+    conecte a 8080 recibirá Connection refused, porque nadie escucha ahí.
+  - Lo mismo del lado del cliente: se conectará a un puerto distinto del
+    pretendido (o fallará), y si ese otro puerto pertenece a otro servicio
+    puede acabar hablando con el servicio equivocado.
+  - En el peor caso, si el número resultante es 0, bind() asociaría el
+    puerto efímero que asigne el sistema, con el mismo efecto de
+    inaccesibilidad.
+  - Los errores así son muy difíciles de detectar porque no hay error del
+    sistema operativo: todo "funciona", simplemente apunta al lugar
+    equivocado. Por eso la regla es convertir SIEMPRE con htons()/htonl()
+    al escribir en la estructura y ntohs()/ntohl() al leerla, tanto en
+    servidores como en clientes.
+
+
+================================================================================
+EJERCICIO 3 – ej03_resolver.c
+================================================================================
+
+Salidas reales (ver capturas ej03_a.png y ej03_b.png):
+
+  ./ej03_resolver localhost http
+  Resolviendo host="localhost" servicio="http"
+    [0] IPv6 ::1                                     puerto 80
+         nombre inverso: localhost
+    [1] IPv4 127.0.0.1                               puerto 80
+         nombre inverso: localhost
+
+  ./ej03_resolver google.com https
+  Resolviendo host="google.com" servicio="https"
+    [0] IPv6 2800:3f0:4002:804::200e                 puerto 443
+         nombre inverso: no existe (Temporary failure in name resolution)
+    [1] IPv4 142.251.133.238                         puerto 443
+         nombre inverso: lcezea-ai-in-f14.1e100.net
+
+  ./ej03_resolver example.com 8080
+  Resolviendo host="example.com" servicio="8080"
+    [0] IPv6 2606:4700:10::6814:179a                 puerto 8080
+         nombre inverso: no existe (Temporary failure in name resolution)
+    [1] IPv6 2606:4700:10::ac42:93f3                 puerto 8080
+         nombre inverso: no existe (Temporary failure in name resolution)
+    [2] IPv4 172.66.147.243                          puerto 8080
+         nombre inverso: no existe (Temporary failure in name resolution)
+    [3] IPv4 104.20.23.154                           puerto 8080
+         nombre inverso: no existe (Temporary failure in name resolution)
+  (4 direcciones en total: 2 IPv6 + 2 IPv4, todas del CDN de Cloudflare)
+
+  ./ej03_resolver no-existe-xyz123 http
+  getaddrinfo(no-existe-xyz123, http): Name or service not known   (exit 1)
+
+Notas de implementación:
+  - hints: memset a cero, ai_family = AF_UNSPEC (acepta IPv4 e IPv6),
+    ai_socktype = SOCK_STREAM (el enunciado lo pide).
+  - El nombre inverso se pide con NI_NAMEREQD: si no hay PTR, se informa
+    "no existe (…)" en lugar de devolver la IP como si fuera un nombre.
+  - Los buffers del servicio usan NI_MAXSERV (32), no NI_NUMERICSERV: éste
+    último es un FLAG (valor 2), no un tamaño; usarlo como tamaño da
+    EAI_OVERFLOW ("Result too large for supplied buffer").
+  - Se llama freeaddrinfo(res) siempre, también en los caminos de error.
+
+
+P1. ¿Cuántas direcciones devuelve cada nombre? ¿Por qué un mismo nombre puede tener varias?
+--------------------------------------------------------------------------------
+En nuestras pruebas:
+  - localhost        -> 2 direcciones (IPv6 ::1 y IPv4 127.0.0.1)
+  - google.com       -> 2 direcciones (una IPv6 2800:3f0:4002:804::200e y
+                        una IPv4 142.251.133.238)
+  - example.com      -> 4 direcciones (2 IPv6 de Cloudflare 2606:4700:10::…
+                        y 2 IPv4 172.66.147.243 / 104.20.23.154)
+  - no-existe-xyz123 -> ninguna: getaddrinfo() falla con
+                        "Name or service not known" (EAI_NONAME) y el
+                        programa sale con código 1.
+
+Todas las resoluciones terminaron con rc=0 salvo el nombre inexistente
+(rc=1). Nota: para example.com y google.com la consulta del nombre inverso
+tarda varios minutos en este entorno (el PTR de IPv6 se dispara contra un
+servidor de nombres muy lento), por eso para la captura se usa un timeout
+de 900 s; el programa en sí funciona correctamente.
+
+Un mismo nombre puede tener varias direcciones por varias razones:
+  a) Soporte dual: el host puede tener direcciones IPv4 e IPv6 a la vez
+     (lo que se ve en localhost y en google.com). AF_UNSPEC pide las dos
+     familias, por eso el programa las muestra todas.
+  b) Balanceo de carga y redundancia: un mismo nombre puede resolver a
+     varias IP de la misma familia (example.com devuelve 2 IPv6 y 2 IPv4)
+     para repartir el tráfico entre varios servidores y poder cambiar de
+     máquina sin cambiar el nombre.
+  c) Varios servicios/puertos: aunque aquí fijamos SOCK_STREAM, en general
+     getaddrinfo() devuelve tantos nodos como combinaciones dirección+puerto
+     resulten de la consulta.
+  d) El orden en que aparecen es una pista de prioridad: el sistema suele
+     poner primero la familia preferida (en este entorno, IPv6 primero).
+
+Además, para cada dirección intentamos el nombre inverso (PTR): a veces
+existe (localhost, google.com en IPv4 -> *.1e100.net), a veces no
+(example.com) o el resolver del entorno es tan lento para PTR de IPv6 que
+acaba en "Temporary failure in name resolution" (no es un error del
+programa: es el servidor de nombres del entorno).
+
+
+P2. ¿De dónde obtiene el sistema el número de puerto del servicio http?
+--------------------------------------------------------------------------------
+De la base de datos de servicios del sistema, el archivo /etc/services (y
+en última instancia de la base de datos de servicios que configure NSS con
+"services: files dns" en /etc/nsswitch.conf). /etc/services contiene el
+mapeo nombre de servicio <-> número de puerto y protocolo:
+
+    http    80/tcp    www www-http    # World Wide Web HTTP
+    https   443/tcp   http ssl        # HTTP over TLS/SSL
+
+getaddrinfo("localhost", "http", ...) traduce "http" a 80 consultando ese
+archivo (vía getent/services / getservbyname). Esto tiene una ventaja
+importante: si el servicio no está en la lista de puertos conocidos, el
+sistema hace la consulta de nombres del servicio a través de DNS (registro
+SRV) en vez de fallar. Y si el usuario pasa un número ("8080") en lugar de
+un nombre, getaddrinfo() lo usa directamente como puerto — por eso las
+pruebas con "example.com 8080" devuelven el puerto 8080.
+
+
+P3. ¿Por qué los errores de getaddrinfo() no se informan con perror()?
+--------------------------------------------------------------------------------
+Porque getaddrinfo() (y getnameinfo()) NO usan la variable errno. Estas
+funciones devuelven el código de error directamente como valor de retorno
+(un entero positivo, distinto de 0), y ese código es un código EAI_*
+estándar (EAI_NONAME, EAI_AGAIN, EAI_FAIL, EAI_OVERFLOW, EAI_SYSTEM, …),
+no un errno del sistema.
+
+perror()/strerror() leen errno, que en este caso no fue escrito por
+getaddrinfo() y contiene cualquier cosa que haya quedado de una llamada
+anterior: imprimirlo daría un mensaje engañoso y sin relación con el error
+real. Por eso el enunciado pide expresamente informarlos con gai_strerror():
+devuelve el texto del código devuelto por la función, p. ej.
+
+    getaddrinfo(no-existe-xyz123, http): Name or service not known
+
+La única excepción es EAI_SYSTEM: en ese caso el error real sí está en
+errno y lo habitual es combinar perror() con gai_strerror(). Nuestros
+programas usan siempre gai_strerror(rc), que es lo correcto para los
+códigos EAI_ habituales.
+
+
+P4. ¿Qué ventajas tiene getaddrinfo() sobre gethostbyname()?
+--------------------------------------------------------------------------------
+1. Soporta IPv4 E IPv6 a la vez: gethostbyname() sólo devuelve direcciones
+   IPv4 (struct hostent con h_addr_list en IPv4); getaddrinfo() con
+   AF_UNSPEC devuelve una lista de struct addrinfo con la familia de cada
+   nodo, lo que hace que los programas funcionen en la Internet actual
+   (IPv6) sin reescribirlos. Ejemplo visible en la salida: localhost
+   devuelve ::1 y 127.0.0.1.
+2. Resuelve también el SERVICIO (nombre -> puerto) y lo integra en la
+   misma llamada: gethostbyname() sólo resolvía el host y el puerto había
+   que ponerlo a mano con htons(puerto). Con getaddrinfo() el puerto ya
+   viene listo y en orden de red dentro de ai_addr.
+3. Devuelve todo lo que hace falta para crear el socket: además de la
+   dirección trae ai_socktype, ai_protocol y ai_addrlen, de modo que el
+   cliente puede hacer socket(rp->ai_family, rp->ai_socktype,
+   rp->ai_protocol) directamente sobre cada nodo (así lo hace
+   ej05_eco_cliente).
+4. Es reentrante / thread-safe: gethostbyname() devuelve un puntero a una
+   estructura estática compartida por todo el proceso (dos llamadas
+   simultáneas se pisan, imposible usarla con hilos); getaddrinfo() entrega
+   la lista en memoria que solicita el programador y que se libera con
+   freeaddrinfo().
+5. Es más flexible: permite filtrar con hints (ai_family, ai_socktype,
+   ai_flags como AI_PASSIVE para el servidor, AI_CANONNAME, …), que era
+   imposible con la antigua API.
+6. Es la API recomendada: gethostbyname() está obsoleta (y en POSIX.1-2008
+   marcada para retirarse); lo propio con gethostbyaddr(), que se reemplaza
+   por getnameinfo() (que además soporta IPv6 y también es reentrante).
+
+
+================================================================================
+EJERCICIO 4 – ej04_saludo_servidor.c
+================================================================================
+
+Salida real (ver captura ej04.png):
+
+  Terminal 1 (servidor):
+  Servidor de saludos escuchando en el puerto 7777 (Ctrl+C para salir)
+  Cliente conectado desde 127.0.0.1:35570
+  Conexión con 127.0.0.1:35570 cerrada
+  Cliente conectado desde 127.0.0.1:35576
+  Conexión con 127.0.0.1:35576 cerrada
+  Cliente conectado desde 127.0.0.1:51306
+  Conexión con 127.0.0.1:51306 cerrada
+
+  Terminal 2 (nc):
+  nc -4 -w 3 127.0.0.1 7777 < /dev/null
+  Hola, te conectaste desde 127.0.0.1:35570
+  nc -4 -w 3 127.0.0.1 7777 < /dev/null
+  Hola, te conectaste desde 127.0.0.1:35576
+  nc -4 -w 3 127.0.0.1 7777 < /dev/null
+  Hola, te conectaste desde 127.0.0.1:51306
+
+Secuencia implementada: socket(AF_INET, SOCK_STREAM, 0) -> setsockopt
+(SO_REUSEADDR) -> bind a INADDR_ANY:puerto -> listen(10) -> bucle de
+accept(); por cada conexión: getnameinfo/inet_ntop + ntohs para informar la
+dirección, send() del saludo (con reintentos ante EINTR y envío parcial)
+y close() de ESE descriptor, volviendo a accept() sin terminar.
+
+
+P1. ¿Qué se observa en el puerto del cliente en cada conexión? ¿Quién lo asigna y por qué el cliente no llama a bind()?
+--------------------------------------------------------------------------------
+Se observa que el puerto del cliente CAMBIA en cada conexión: 35570,
+35576, 51306, … Son puertos distintos y "raros" (altos, no asociados a
+ningún servicio conocido).
+
+Quién lo asigna es el SISTEMA OPERATIVO del cliente, concretamente el
+kernel al hacer connect(): elige un puerto libre del rango de puertos
+efímeros (net.ipv4.ip_local_port_range, habitualmente 32768-60999 en
+Linux, visible con cat /proc/sys/net/ipv4/ip_local_port_range). Se llama
+"efímero" justamente porque es de uso transitorio y se libera al cerrar la
+conexión; por eso cada conexión nueva obtiene uno distinto.
+
+El cliente NO llama a bind() porque bind() es opcional en el lado cliente:
+la conexión saliente se puede montar sin él. Cuando connect() se hace
+sobre un socket sin asociar, el kernel hace un "bind implícito" a la
+dirección comodín (INADDR_ANY) y a un puerto efímero elegido por él, y
+completa la estructura sockaddr_in del socket. Ventajas de no llamar a
+bind() a mano:
+
+  - El programador no tiene que elegir puerto: no habría forma de saber de
+    antemano si un puerto está libre, y habría que reintentar.
+  - Se evitan los conflictos ("Address already in use") entre varias
+    instancias del mismo cliente.
+  - Se permite que varias conexiones del mismo proceso usen puertos
+    distintos.
+
+El cliente sólo necesita bind() explícito cuando el protocolo lo exige o
+hay una razón concreta: servidores (necesitan un puerto conocido por
+todos), autenticación por IP+puerto (p. ej. FTP de datos), o cuando hay
+que fijar la interfaz de origen. En nuestro cliente TCP (ej05) tampoco
+hay bind() y funciona perfectamente.
+
+
+P2. ¿Qué diferencia hay entre el descriptor que devuelve socket() y el que devuelve accept()? ¿Cuál se cierra después de atender a cada cliente?
+--------------------------------------------------------------------------------
+Son descriptores de distinta naturaleza:
+
+  - socket() devuelve el descriptor del SOCKET DE ESCUCHA (de bienvenida):
+    es un socket que nunca transporta datos, sólo representa el punto de
+    encuentro fijo del servidor en INADDR_ANY:puerto. Se crea UNA SOLA
+    vez, hace bind()+listen() y se mantiene ABIERTO durante toda la vida
+    del servidor.
+  - accept() devuelve el descriptor de una CONEXIÓN YA ESTABLECIDA con un
+    cliente concreto: es un socket nuevo, distinto para cada conexión,
+    con su propio par IP:puerto remoto ya negociado (el handshake TCP
+    terminó antes de que accept() devuelva). No hace falta bind() ni
+    listen() en él: ya está conectado y sólo sirve para send()/recv().
+
+Es decir: el descriptor de listen() identifica "el puerto 7777 del
+servidor" (uno para todos los clientes); el descriptor de accept()
+identifica "la conversación con ESTE cliente" (uno por cliente). Por eso
+accept() debe llamarse en bucle y cada llamada devuelve un descriptor
+distinto.
+
+Tras atender a cada cliente se cierra el descriptor que devolvió
+ACCEPT() (connfd), nunca el de socket() (sockfd). Si se cerrara el de
+socket() el servidor dejaría de escuchar y la siguiente conexión daría
+"Connection refused"; si no se cerrara el de accept() se acumularían
+descriptores (y conexiones) hasta agotarlos. En el programa:
+close(connfd) dentro del bucle; close(sockfd) sólo al final (inalcanzable,
+por completitud).
+
+
+================================================================================
+EJERCICIO 5 – ej05_eco_servidor.c + ej05_eco_cliente.c
+================================================================================
+
+Resultados del experimento (ss -tan | grep 7799, ver capturas
+ej05_a.png, ej05_b.png y ej05_c.png):
+
+Paso 1 – servidor y cliente vivos, se termina el servidor:
+  ESTAB  127.0.0.1:7799      127.0.0.1:40326
+  ESTAB  127.0.0.1:40326     127.0.0.1:7799
+  (tras Ctrl+C al servidor)
+  FIN-WAIT-2   127.0.0.1:7799      127.0.0.1:40326   <- extremo servidor
+  CLOSE-WAIT   127.0.0.1:40326     127.0.0.1:7799    <- extremo cliente
+
+Paso 2 – reinicio con noreuse:
+  bind: Address already in use
+  SO_REUSEADDR desactivado (noreuse)
+
+Paso 3 – reinicio sin noreuse (con SO_REUSEADDR):
+  SO_REUSEADDR activado
+  [18:52:28] Servidor eco escuchando en el puerto 7799      <- arranca OK
+
+Paso 4 – se cierra PRIMERO el cliente:
+  TIME-WAIT  127.0.0.1:40326     127.0.0.1:7799            <- extremo cliente
+  TIME-WAIT  127.0.0.1:7799      127.0.0.1:40326
+
+Paso 5 – cliente contra un puerto sin servidor:
+  Intento 1: 127.0.0.1:7777 ... conexión rechazada: Connection refused
+  No se pudo conectar con 127.0.0.1:7777
+  exit=1
+
+
+P1. ¿En qué estado queda la conexión en el paso 1 y en qué extremo? ¿Cuánto dura ese estado y para qué sirve?
+--------------------------------------------------------------------------------
+Al terminar el SERVIDOR con Ctrl+C, los dos extremos no están en el mismo
+estado:
+
+  - Extremo servidor (127.0.0.1:7799): FIN-WAIT-2. Al cerrar, el servidor
+    envía su FIN; el cliente le devuelve el ACK (por eso pasó de
+    FIN-WAIT-1 a FIN-WAIT-2: ya sabe que el otro recibió su FIN) y el
+    cliente, al recibir el FIN del servidor, pasa a CLOSE-WAIT, esperando
+    que la aplicación lo cierre (en nuestro caso el cliente está bloqueado
+    en fgets(), todavía no cerró). El LISTEN del puerto 7799 desaparece
+    (ya no hay proceso que acepte), pero la conexión vieja sigue viva en
+    el kernel.
+  - Extremo cliente (127.0.0.1:40326): CLOSE-WAIT. Recibió el FIN del
+    servidor pero la aplicación todavía no hizo close(), así que queda
+    "a la espera" de que el programa cierre su lado.
+
+Ese estado (CLOSE-WAIT en el cliente) dura lo que tarde el programa en
+cerrar: si el cliente nunca cierra (se queda bloqueado o tiene un bug),
+CLOSE-WAIT dura indefinidamente (es un "cierre olvidado", típico síntoma
+de memory leak de conexiones).
+
+El estado que SÍ tiene duración fija es TIME-WAIT (ver pregunta 3): en
+Linux dura 2*MSL = 60 segundos (tcp_fin_timeout se refiere a FIN-WAIT-2 y
+por defecto es 60 s; el MSL de Linux es 30 s). TIME_WAIT existe para
+garantizar que: (a) si se pierde el último ACK, el otro extremo pueda
+retransmitir su FIN y este se reenvíe (para que el cierre no quede a medias);
+y (b) que paquetos "atrasados" de esa conexión no lleguen a una conexión
+nueva con los mismos 4-tuples y la corrompan. En el paso 1, sin embargo,
+el que termina es el servidor y el cliente no cerró, por eso todavía no
+aparece TIME_WAIT: aparece recién cuando el cliente haga close().
+
+
+P2. ¿Qué error se obtiene en el paso 2 y por qué no ocurre en el paso 3?
+--------------------------------------------------------------------------------
+Paso 2 (con noreuse):
+
+    bind: Address already in use        (EADDRINUSE)
+
+Porque al reiniciar el servidor con SO_REUSEADDR desactivado, el kernel
+rechaza el bind mientras exista en ese puerto alguna conexión vieja que no
+terminó de liberarse (en nuestro experimento quedaba la conexión en
+FIN-WAIT-2/CLOSE-WAIT del paso 1, con su 4-tuple local 127.0.0.1:7799).
+Sin SO_REUSEADDR, bind() exige que el puerto esté totalmente libre.
+
+Paso 3 (sin noreuse, o sea CON SO_REUSEADDR, que es lo que hace el
+programa por defecto): arranca normalmente:
+
+    SO_REUSEADDR activado
+    [18:52:28] Servidor eco escuchando en el puerto 7799
+
+SO_REUSEADDR le permite al socket hacer bind() a un local:puerto aunque
+haya conexiones en TIME_WAIT (y, en Linux, con las condiciones
+documentadas, aunque queden conexiones en otros estados): el kernel acepta
+el nuevo bind y las conexiones viejas siguen manejándose por su propio
+4-tuple. Ojo: NO confundir con SO_REUSEPORT (que reparte conexiones entre
+varios procesos escuchando el mismo puerto) ni con "reutilizar un puerto
+en uso por un LISTEN activo" (eso sigue fallando: si ya hay un proceso
+escuchando, bind() falla igual aunque se use SO_REUSEADDR).
+
+La opción se activa ANTES de bind() con setsockopt(sockfd, SOL_SOCKET,
+SO_REUSEADDR, &uno, sizeof uno). El enunciado la pide como argumento
+opcional "noreuse" justamente para poder observar la diferencia entre los
+dos casos. Es la opción estándar que necesitan todos los servidores de
+producción para poder reiniciarse sin esperar a que expiren los TIME_WAIT.
+
+
+P3. ¿Dónde aparece el estado TIME_WAIT en el paso 4? ¿Qué regla general se deduce?
+--------------------------------------------------------------------------------
+Al cerrar PRIMERO el cliente, TIME_WAIT aparece en el extremo del CLIENTE,
+o sea en la fila cuya dirección local es la del cliente:
+
+    TIME-WAIT  127.0.0.1:40326   127.0.0.1:7799     <- el cliente (puerto efímero)
+    TIME-WAIT  127.0.0.1:7799    127.0.0.1:40326    <- la misma conexión vista al revés
+
+Regla general: TIME_WAIT queda SIEMPRE en el extremo que envía el PRIMER
+FIN, o sea el que cierra la conexión PRIMERO (el "active closer"). El otro
+extremo, al recibir ese FIN, pasa a CLOSE-WAIT y después de cerrar su lado
+pasa directamente a LAST_ACK -> CLOSED; nunca pasa por TIME_WAIT.
+
+De ahí dos consecuencias prácticas importantes:
+  - En un cliente-servidor tradicional el cliente cierra primero, así que
+    TIME_WAIT lo acumula el cliente (y como el cliente usa puertos
+    efímeros, rara vez molesta).
+  - Si quien cierra primero es el SERVIDOR (p. ej. HTTP o nuestro eco
+    tras detectar el cierre), TIME_WAIT queda en el puerto de servicio del
+    servidor: ahí sí molesta, porque al reiniciar el servidor sin
+    SO_REUSEADDR aparece "Address already in use" (exactamente lo del paso
+    2). De ahí que SO_REUSEADDR sea obligatorio en todo servidor.
+
+
+P4. ¿Qué error se obtiene en el paso 5? ¿Qué indica sobre el destino?
+--------------------------------------------------------------------------------
+El cliente contra un puerto sin servidor falla en el connect(), que es
+donde lo detecta nuestro programa mostrando cada intento:
+
+    Intento 1: 127.0.0.1:7777 ... conexión rechazada: Connection refused
+    No se pudo conectar con 127.0.0.1:7777
+    exit=1
+
+El error es ECONNREFUSED (Connection refused). Indica que SÍ hubo una
+respuesta, pero negativa: el destino (o el propio host) devolvió un
+paquete RST (reset) porque en ese puerto no hay NADIE escuchando (ningún
+socket en LISTEN). Es decir, indica que el destino es ALCANZABLE (la red
+responde, el host está encendido y le llegó el SYN) pero el SERVICIO no
+está corriendo en ese puerto: no hay proceso en LISTEN.
+
+Matiz importante: en UDP esto NO es así (ver ejercicio 6): como no hay
+handshake, contra un puerto cerrado no llega RST, sino que el cliente
+simplemente no recibe nada (timeout). Y si el destino estuviera caído o
+inalcanzable (host fuera de la red, cable cortado), el error sería
+distinto: ETIMEDOUT ("Connection timed out") en vez de ECONNREFUSED.
+
+
+P5. ¿Por qué el cliente no debe limitarse a la primera dirección que devuelve getaddrinfo()?
+--------------------------------------------------------------------------------
+Porque getaddrinfo() devuelve una LISTA y la primera no es garantía de
+éxito. Motivos concretos:
+
+1. La primera dirección puede no estar disponible ahora mismo: puede ser
+   una IP IPv6 del host que hoy no tiene ruta, una IP caída, o un
+   balanceador averiado, mientras que las siguientes sí funcionan.
+2. El orden de la lista es sólo una PREFERENCIA (lo que el resolver cree
+   mejor en ese momento), no un hecho. Dependiendo de la configuración
+   (RFC 6724 - destino address selection, /etc/gai.conf, sorted
+   responses), la primera puede ser IPv6 cuando el host de destino no
+   está disponible por IPv6 (situación muy común con redes IPv4-only:
+   "happy eyeballs" justamente trata esto).
+3. Servicios con varias IP: un nombre puede apuntar a varios servidores
+   (CDN, balanceo); si el primero no responde, el resto sigue siendo
+   válido.
+4. Un nodo de la lista puede fallar también en socket() (familia no
+   soportada en este host, por ejemplo IPv6 deshabilitado), no sólo en
+   connect().
+
+Por eso el enunciado pide "probar cada dirección de la lista hasta que una
+conexión tenga éxito". Nuestro cliente lo hace y muestra cada intento:
+
+    Intento 1: 127.0.0.1:7799 ... conectado
+
+    (si fallara:)
+    Intento 1: [IPv6] ... conexión rechazada: Network is unreachable
+    Intento 2: [IPv4] ... conectado
+
+El patrón correcto es: getaddrinfo() -> bucle for sobre rp ->
+socket(rp->ai_family, ...) -> connect(); si connect() falla, close() de
+ese socket y continuar con el siguiente; si se acaba la lista sin éxito,
+informar el error. Además hay que liberar la lista con freeaddrinfo()
+tanto si se conectó como si no (lo hace nuestro cliente).
+
+
+================================================================================
+EJERCICIO 6 – ej06_udp_servidor.c + ej06_udp_cliente.c
+================================================================================
+
+Resultados reales (ver capturas ej06_a.png y ej06_b.png):
+
+CON servidor arriba (los dos modos funcionan):
+  Modo NO conectado (sendto/recvfrom) con 127.0.0.1:7788
+    mensaje 1 (1 bytes) intento 1/3: respuesta OK, 1 bytes
+    mensaje 2 (18 bytes) intento 1/3: respuesta OK, 18 bytes
+    mensaje 3 (1000 bytes) intento 1/3: respuesta OK, 1000 bytes
+  Modo CONECTADO (connect + send/recv) con 127.0.0.1:7788
+    mensaje 1 (1 bytes) intento 1/3: respuesta OK, 1 bytes
+    mensaje 2 (18 bytes) intento 1/3: respuesta OK, 18 bytes
+    mensaje 3 (1000 bytes) intento 1/3: respuesta OK, 1000 bytes
+
+  Log del servidor (recvfrom + sendto):
+    Servidor UDP escuchando en el puerto 7788 (Ctrl+C para salir)
+    datagrama de 127.0.0.1:46668 -> 1 bytes
+    datagrama de 127.0.0.1:46668 -> 18 bytes
+    datagrama de 127.0.0.1:46668 -> 1000 bytes
+    datagrama de 127.0.0.1:53513 -> 1 bytes
+    datagrama de 127.0.0.1:53513 -> 18 bytes
+    datagrama de 127.0.0.1:53513 -> 1000 bytes
+
+SIN servidor (comparación de los dos modos):
+
+  Modo NO conectado (sendto/recvfrom):
+    mensaje 1 (1 bytes) intento 1/3: sin respuesta (timeout de 2 s): Resource temporarily unavailable
+    mensaje 1 (1 bytes) intento 2/3: sin respuesta (timeout de 2 s): Resource temporarily unavailable
+    mensaje 1 (1 bytes) intento 3/3: sin respuesta (timeout de 2 s): Resource temporarily unavailable
+    -> mensaje 1 abandonado tras 3 intentos
+    ... (idéntico para los mensajes 2 y 3)
+    total: 18,4 segundos  (9 intentos x 2 s de timeout)
+
+  Modo CONECTADO (connect + send/recv):
+    Modo CONECTADO (connect + send/recv) con 127.0.0.1:7788
+    mensaje 1 (1 bytes) intento 1/3: recv falló: Connection refused
+    ... (falla de inmediato, sin esperar los timeouts)
+
+Implementación: el servidor usa getaddrinfo(AF_UNSPEC, SOCK_DGRAM,
+AI_PASSIVE) para asociar tanto IPv4 como IPv6 (si la primera dirección es
+IPv6 desactiva IPV6_V6ONLY=0 para que acepte también IPv4 mapeado, con un
+solo socket dual-stack). El cliente usa la primera dirección de la lista,
+fija SO_RCVTIMEO = 2 s con setsockopt y reintenta hasta 3 veces.
+
+
+P1. ¿Cada recvfrom() devuelve exactamente un datagrama? ¿En qué se diferencia esto de TCP?
+--------------------------------------------------------------------------------
+Sí: recvfrom() devuelve COMO MÁXIMO UN datagrama por llamada, y ese datagrama
+es siempre el que envió el emisor con sendto(). Si el búfer es más grande que
+el datagrama, el resto queda vacío (no hay "cola" de bytes: lo que sobra no
+se rellena con el siguiente mensaje); y si el búfer fuera más chico que el
+datagrama, el exceso se descarta silenciosamente (UDP no reensambla). En
+nuestro programa el búfer es de 2048 bytes y los mensajes son de 1, 18 y
+1000 bytes, y justamente por eso el cliente verifica que la respuesta tenga
+EXACTAMENTE el tamaño enviado: si recvfrom() devolviera 1 byte cuando se
+enviaron 1000, algo anda mal.
+
+Diferencias con TCP:
+  - TCP es un FLUJO de bytes: no tiene mensajes ni límites. recv() puede
+    devolver 1 byte de un envío de 1000, o 1000 bytes de dos envíos de 500:
+    la frontera de send() no se conserva. Por eso en TCP hay que leer hasta
+    completar lo que se espera (nuestro ej05 usa un bucle "recibir_todo").
+  - UDP preserva la correspondencia 1 datagrama = 1 recvfrom(). Por eso,
+    si queremos mensajes delimitados, UDP nos lo regala; en TCP hay que
+    inventar la delimitación (longitud, delimitador de fin de línea, etc.).
+  - UDP puede perder, duplicar o reordenar datagramas (recvfrom() simplemente
+    no vuelve si el datagrama se perdió); TCP garantiza entrega, orden y sin
+    duplicados dentro de la conexión.
+  - recvfrom() además devuelve el remitente (struct sockaddr_storage),
+    algo que en TCP es innecesario porque el socket ya está atado a su par
+    (nuestro servidor lo usa para responder con sendto() a la misma
+    dirección).
+
+
+P2. ¿Qué se observa en cada modo con el servidor apagado? ¿Por qué solo uno de ellos detecta que no hay servidor?
+--------------------------------------------------------------------------------
+Modo NO conectado (sendto/recvfrom): los 3 mensajes fallan por TIMEOUT.
+Cada intento espera los 2 segundos fijados con SO_RCVTIMEO y devuelve
+EAGAIN/EWOULDBLOCK ("Resource temporarily unavailable"); se reintentan las
+3 veces por mensaje, o sea 9 esperas x 2 s = 18,4 segundos en total, y
+cada mensaje queda "abandonado tras 3 intentos". El cliente termina con
+exit=0 porque para él no hubo error de sistema: simplemente "nadie
+respondió".
+
+Modo CONECTADO (connect + send/recv): detecta el problema DE INMEDIATO, en
+el primer intento:
+
+    mensaje 1 (1 bytes) intento 1/3: recv falló: Connection refused
+
+Por qué sólo uno lo detecta (y tan rápido):
+
+ - En el modo NO conectado, sendto() es un "disparo a ciegas": el paquete
+    sale hacia127.0.0.1:7788 y en el host local el kernel ve que no hay
+    ningún socket en LISTEN en ese puerto, descarta el datagrama (lo manda
+    al "puerto cerrado") y NO genera ninguna respuesta para el emisor: no
+    hay handshake, no hay RST esperado por quien no tiene conexión. Como
+    nada llega de vuelta, la única forma de enterarse es esperar y no
+    recibir nada -> timeout.
+  - En el modo conectado, connect() ANCLÓ el socket a ese destino: a
+    partir de ahí el kernel trata los errores de destino como errores de
+    ESTE socket (pasa a registrar un error local). Al enviar, el kernel
+    detecta el mismo hecho (nada escuchando en ese puerto local) y, como
+    el socket tiene destino fijo, el ICMP "port unreachable" recibido se
+    traduce en ECONNREFUSED que se entrega a recv() (o al siguiente
+    send/recv). Por eso aparece "Connection refused" casi instantáneamente,
+    sin agotar los timeouts: hay una señal concreta del sistema, no una
+    ausencia de datos.
+
+Resumen: con UDP no conectado el error es "no me llegó nada" (informativo
+y lento, sólo un timeout); con UDP conectado el error es "el sistema dice
+que no hay nadie ahí" (ECONNREFUSED, inmediato). Es una de las razones
+prácticas por las que conviene hacer connect() en sockets UDP: el kernel
+filtra paquetes ajenos, resuelve rutas una sola vez y notifica errores de
+destino.
+
+
+P3. ¿Qué hace connect() sobre un socket UDP? ¿Envía algún paquete?
+--------------------------------------------------------------------------------
+connect() en un socket UDP NO envía NINGÚN paquete de red: no hay
+handshake (UDP no lo tiene), no se abre ninguna conexión. Lo que hace es
+pura configuración local dentro del kernel:
+
+  1. Fija la dirección y puerto DE DESTINO POR DEFECTO del socket. A partir
+     de ahí se puede usar send()/recv() en vez de sendto()/recvfrom()
+     (nuestro modo "conectado" hace exactamente eso).
+  2. Filtra los paquetes ENTRANTES: sólo se entregan al socket los
+     datagramas que vengan de ese destino. Los que lleguen de otros
+     emisores (o de otro puerto) se descartan. Esto protege contra
+     mensajes inesperados.
+  3. Permite que el kernel resuelva y memorice la ruta (y el MTU) hacia el
+     destino una sola vez, en vez de en cada envío: send() es más rápido.
+  4. Registra un error LOCAL de destino: si el destino es inalcanzable,
+     el kernel guarda ECONNREFUSED/ENETUNREACH/EHOSTUNREACH y lo entrega
+     al recv() siguiente (justamente lo que permite el punto 2 anterior).
+  5. En algunos casos permite recibir ICMP errors vinculados al destino.
+
+"Desconectar" un socket UDP (para volver a poder usar sendto() con otro
+destino) se hace llamando connect() con un sockaddr de familia AF_UNSPEC.
+
+Dato para la captura: se puede comprobar que connect() no manda nada con
+`ss -uanp` antes y después (aparece la columna peer del socket, pero no
+hay tráfico en la red). En nuestro programa, el mensaje "Modo CONECTADO"
+aparece inmediatamente después de la llamada, sin intercambio de paquetes.
+
+
+P4. Aunque se use el modo conectado, ¿por qué sigue siendo necesario el timeout?
+--------------------------------------------------------------------------------
+Porque connect() en UDP NO garantiza que vaya a haber respuesta: sólo
+ancla el destino y habilita la detección de errores, pero la entrega sigue
+siendo "mejor esfuerzo". El timeout sigue siendo necesario porque:
+
+ 1. El datagrama PUEDE PERDERSE igual: el emisor no sabe si llegó, y si
+    se perdió, nadie va a responder nunca. Sin timeout, recv() quedaría
+    bloqueado para siempre (no hay cierre de conexión que lo despertara,
+    como en TCP).
+ 2. El servidor puede recibir el mensaje y NO responder (bug, búfer lleno,
+    proceso colgado): de nuevo, nadie manda nada y recv() se colgaría.
+ 3. La respuesta PUEDE PERDERSE de vuelta: el servidor respondió, pero el
+    datagrama de respuesta se cayó. Sólo el reintento con timeout cubre
+    ese caso (el cliente reenvía y el servidor responde de nuevo).
+ 4. El servidor puede estar VIVO pero NO escuchando en ese puerto (o
+    escuchando en otra IP): en ese caso puede que no llegue ningún ICMP
+    utilizable (p. ej. si el paquete se pierde antes, o el error tarda) y
+    lo único que queda es esperar.
+ 5. El error ECONNREFUSED del modo conectado no es infalible: puede
+    llegar tarde, o no llegar (fuego de red, destino remoto, etc.). El
+    timeout es el mecanismo de respaldo universal.
+
+Es decir: el timeout + los reintentos es la implementación EN LA
+APLICACIÓN de la confiabilidad que UDP no da. Es exactamente lo que pide
+el enunciado (SO_RCVTIMEO = 2 s, hasta 3 intentos, informando cada uno):
+la capa de red no garantiza nada, así que el programa lo garantiza
+reintentando. Aun en modo conectado, si el primer recv() devuelve
+ECONNREFUSED, nuestro programa también reintenta hasta agotar los 3
+intentos (informando "recv falló: ..."), porque ese error también puede
+ser transitorio.
+
+
+================================================================================
+NOTAS SOBRE LAS PRUEBAS
+================================================================================
+- Compilación: los 8 programas compilan con gcc -Wall -Wextra sin ningún
+  warning ni error (verificado con make tras make clean).
+- Validación de argumentos: todos muestran el mensaje de uso y devuelven
+  exit status 1 cuando los argumentos son incorrectos (probado en todos).
+- Requisitos comunes (retornos de API, htons/htonl/ntohs/ntohl, memset en
+  cero, close()/freeaddrinfo(), comentarios) cumplidos y comentados en el
+  código fuente.
+- Las capturas de pantalla están en docs/capturas/ y se tomaron en el
+  espacio de trabajo 9 del gestor de ventanas, con la terminal limpia
+  (zsh sin plugins) para que sólo se vea la salida del programa.
+- Ninguno de los 6 ejercicios requiere navegador, por lo que no hay
+  capturas de navegador.

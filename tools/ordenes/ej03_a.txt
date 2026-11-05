@@ -1,0 +1,3 @@
+clear
+./ej03_resolver localhost http
+./ej03_resolver no-existe-xyz123 http

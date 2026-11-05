@@ -1,0 +1,2 @@
+clear
+./ej01_sockets reutilizar

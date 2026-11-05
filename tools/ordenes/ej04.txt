@@ -1,0 +1,7 @@
+clear
+./ej04_saludo_servidor 7777
+#split
+#focus 1
+nc -4 -w 3 127.0.0.1 7777 < /dev/null
+nc -4 -w 3 127.0.0.1 7777 < /dev/null
+nc -4 -w 3 127.0.0.1 7777 < /dev/null
